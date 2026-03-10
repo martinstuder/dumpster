@@ -424,6 +424,7 @@ fn contains_gcs<T: Trace + ?Sized>(x: &T) -> Result<bool, ()> {
 struct ContainsGcs(bool);
 
 impl Visitor for ContainsGcs {
+    #[inline]
     fn visit_sync<T>(&mut self, _: &sync::Gc<T>)
     where
         T: Trace + Send + Sync + ?Sized,
@@ -431,6 +432,7 @@ impl Visitor for ContainsGcs {
         self.0 = true;
     }
 
+    #[inline]
     fn visit_unsync<T>(&mut self, _: &unsync::Gc<T>)
     where
         T: Trace + ?Sized,

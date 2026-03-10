@@ -34,6 +34,7 @@ use std::{
 use crate::{TraceWith, Visitor};
 
 unsafe impl<V: Visitor> TraceWith<V> for Infallible {
+    #[inline]
     fn accept(&self, _: &mut V) -> Result<(), ()> {
         match *self {}
     }
@@ -41,6 +42,7 @@ unsafe impl<V: Visitor> TraceWith<V> for Infallible {
 
 #[cfg(feature = "either")]
 unsafe impl<V: Visitor, A: TraceWith<V>, B: TraceWith<V>> TraceWith<V> for either::Either<A, B> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         match self {
             either::Either::Left(a) => a.accept(visitor),
@@ -82,12 +84,14 @@ param_trivial_impl_sized!(std::future::Pending<T>);
 param_trivial_impl_sized!(std::mem::Discriminant<T>);
 
 unsafe impl<V: Visitor, T: TraceWith<V> + ?Sized> TraceWith<V> for Box<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         (**self).accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T> TraceWith<V> for BuildHasherDefault<T> {
+    #[inline]
     fn accept(&self, _: &mut V) -> Result<(), ()> {
         Ok(())
     }
@@ -97,6 +101,7 @@ unsafe impl<V: Visitor, T: ToOwned> TraceWith<V> for Cow<'_, T>
 where
     T::Owned: TraceWith<V>,
 {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         if let Cow::Owned(ref v) = self {
             v.accept(visitor)?;
@@ -159,30 +164,35 @@ unsafe impl<V: Visitor, T: TraceWith<V>, E: TraceWith<V>> TraceWith<V> for Resul
 }
 
 unsafe impl<V: Visitor, T: Copy + TraceWith<V>> TraceWith<V> for Cell<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.get().accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for OnceCell<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.get().map_or(Ok(()), |x| x.accept(visitor))
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for OnceLock<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.get().map_or(Ok(()), |x| x.accept(visitor))
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::cmp::Reverse<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.0.accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V> + ?Sized> TraceWith<V> for std::io::BufReader<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.get_ref().accept(visitor)
     }
@@ -191,12 +201,14 @@ unsafe impl<V: Visitor, T: TraceWith<V> + ?Sized> TraceWith<V> for std::io::BufR
 unsafe impl<V: Visitor, T: TraceWith<V> + std::io::Write + ?Sized> TraceWith<V>
     for std::io::BufWriter<T>
 {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.get_ref().accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>, U: TraceWith<V>> TraceWith<V> for std::io::Chain<T, U> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         let (t, u) = self.get_ref();
         t.accept(visitor)?;
@@ -205,6 +217,7 @@ unsafe impl<V: Visitor, T: TraceWith<V>, U: TraceWith<V>> TraceWith<V> for std::
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::io::Cursor<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.get_ref().accept(visitor)
     }
@@ -213,36 +226,42 @@ unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::io::Cursor<T> {
 unsafe impl<V: Visitor, T: TraceWith<V> + std::io::Write + ?Sized> TraceWith<V>
     for std::io::LineWriter<T>
 {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.get_ref().accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::io::Take<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.get_ref().accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::mem::ManuallyDrop<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         (**self).accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::num::Saturating<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.0.accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::num::Wrapping<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.0.accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::Range<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.start.accept(visitor)?;
         self.end.accept(visitor)
@@ -250,12 +269,14 @@ unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::Range<T> {
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::RangeFrom<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.start.accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::RangeInclusive<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.start().accept(visitor)?;
         self.end().accept(visitor)
@@ -263,18 +284,21 @@ unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::RangeInclusi
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::RangeTo<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.end.accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::RangeToInclusive<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.end.accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::Bound<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         match self {
             std::ops::Bound::Included(x) | std::ops::Bound::Excluded(x) => x.accept(visitor),
@@ -286,6 +310,7 @@ unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::ops::Bound<T> {
 unsafe impl<V: Visitor, B: TraceWith<V>, C: TraceWith<V>> TraceWith<V>
     for std::ops::ControlFlow<B, C>
 {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         match self {
             std::ops::ControlFlow::Continue(c) => c.accept(visitor),
@@ -295,12 +320,14 @@ unsafe impl<V: Visitor, B: TraceWith<V>, C: TraceWith<V>> TraceWith<V>
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::panic::AssertUnwindSafe<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         self.0.accept(visitor)
     }
 }
 
 unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::task::Poll<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         match self {
             std::task::Poll::Ready(r) => r.accept(visitor),
@@ -346,6 +373,7 @@ unsafe impl<V: Visitor, T: TraceWith<V>> TraceWith<V> for std::vec::IntoIter<T> 
 unsafe impl<Z: Visitor, K: TraceWith<Z>, V: TraceWith<Z>, S: BuildHasher + TraceWith<Z>>
     TraceWith<Z> for HashMap<K, V, S>
 {
+    #[inline]
     fn accept(&self, visitor: &mut Z) -> Result<(), ()> {
         for (k, v) in self {
             k.accept(visitor)?;
@@ -358,6 +386,7 @@ unsafe impl<Z: Visitor, K: TraceWith<Z>, V: TraceWith<Z>, S: BuildHasher + Trace
 unsafe impl<Z: Visitor, T: TraceWith<Z>, S: BuildHasher + TraceWith<Z>> TraceWith<Z>
     for HashSet<T, S>
 {
+    #[inline]
     fn accept(&self, visitor: &mut Z) -> Result<(), ()> {
         for elem in self {
             elem.accept(visitor)?;
@@ -367,6 +396,7 @@ unsafe impl<Z: Visitor, T: TraceWith<Z>, S: BuildHasher + TraceWith<Z>> TraceWit
 }
 
 unsafe impl<Z: Visitor, K: TraceWith<Z>, V: TraceWith<Z>> TraceWith<Z> for BTreeMap<K, V> {
+    #[inline]
     fn accept(&self, visitor: &mut Z) -> Result<(), ()> {
         for (k, v) in self {
             k.accept(visitor)?;
@@ -573,6 +603,7 @@ macro_rules! Trace_tuple {
     () => {}; // This case is handled above by the trivial case
     ($($args:ident),*) => {
         unsafe impl<V: Visitor, $($args: TraceWith<V>),*> TraceWith<V> for ($($args,)*) {
+            #[inline]
             fn accept(&self, visitor: &mut V) -> Result<(), ()> {
                 #[expect(clippy::allow_attributes)]
                 #[allow(non_snake_case)]
@@ -600,6 +631,7 @@ Trace_tuple!(A, B, C, D, E, F, G, H, I, J);
 macro_rules! Trace_fn {
     ($ty:ty $(,$args:ident)*) => {
         unsafe impl<V: Visitor, Ret $(,$args)*> TraceWith<V> for $ty {
+            #[inline]
             fn accept(&self, _: &mut V) -> Result<(), ()> { Ok(()) }
         }
     }

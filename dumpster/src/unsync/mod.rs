@@ -602,6 +602,7 @@ pub(super) struct Rehydrate {
 }
 
 impl Visitor for Rehydrate {
+    #[inline]
     fn visit_sync<T>(&mut self, _: &crate::sync::Gc<T>)
     where
         T: Trace + Send + Sync + ?Sized,
@@ -834,6 +835,7 @@ impl<T: Trace + ?Sized> Deref for Gc<T> {
     ///     this,
     /// });
     /// ```
+    #[inline]
     fn deref(&self) -> &Self::Target {
         unsafe {
             &self.ptr.get().expect("dereferencing Gc to already-collected object. \
@@ -881,6 +883,7 @@ impl<T: Trace + ?Sized> Clone for Gc<T> {
     /// # drop(gc1);
     /// # dumpster::unsync::collect();
     /// ```
+    #[inline]
     fn clone(&self) -> Self {
         let Some(ptr) = self.ptr.get().as_option() else {
             return Self {
@@ -1052,6 +1055,7 @@ impl CollectInfo {
 }
 
 unsafe impl<V: Visitor, T: Trace + ?Sized> TraceWith<V> for Gc<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         visitor.visit_unsync(self);
         Ok(())

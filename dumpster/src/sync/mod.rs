@@ -700,6 +700,7 @@ impl Visitor for Rehydrate {
         }
     }
 
+    #[inline]
     fn visit_unsync<T>(&mut self, _: &crate::unsync::Gc<T>)
     where
         T: Trace + ?Sized,
@@ -1027,6 +1028,7 @@ impl<T: Trace + Send + Sync> Gc<[T]> {
 }
 
 unsafe impl<V: Visitor, T: Trace + Send + Sync + ?Sized> TraceWith<V> for Gc<T> {
+    #[inline]
     fn accept(&self, visitor: &mut V) -> Result<(), ()> {
         visitor.visit_sync(self);
         Ok(())

@@ -249,6 +249,7 @@ struct Reachability {
 }
 
 impl Visitor for Dfs {
+    #[inline]
     fn visit_sync<T>(&mut self, _: &crate::sync::Gc<T>)
     where
         T: Trace + Send + Sync + ?Sized,
@@ -291,6 +292,7 @@ pub(super) struct Mark {
 }
 
 impl Visitor for Mark {
+    #[inline]
     fn visit_sync<T>(&mut self, _: &crate::sync::Gc<T>)
     where
         T: Trace + Send + Sync + ?Sized,
@@ -322,6 +324,7 @@ pub(super) struct DropAlloc<'a> {
 }
 
 impl Visitor for DropAlloc<'_> {
+    #[inline]
     fn visit_sync<T>(&mut self, _: &crate::sync::Gc<T>)
     where
         T: Trace + Send + Sync + ?Sized,
