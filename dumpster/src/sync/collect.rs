@@ -63,6 +63,12 @@ struct GarbageTruck {
 
 /// A structure containing the global information for the garbage collector.
 pub(super) struct Dumpster {
+    /// Whether the current thread is running a cleanup process.
+    ///
+    /// Consolidating this flag into `Dumpster` is safe because the sync `Dumpster` has no Drop
+    /// impl that would trigger re-entrant collection, and the `try_with` guard in
+    /// `notify_dropped_gc` already prevents collection from being triggered during TLS destruction.
+    cleaning: Cell<bool>,
     /// A lookup table for the allocations which may need to be cleaned up later.
     pub contents: RefCell<HashMap<AllocationId, TrashCan>>,
     /// The number of times an allocation on this thread has been dropped.
@@ -130,25 +136,10 @@ thread_local! {
     /// Allocations which are "dirty" will be transferred to this dumpster before being moved into
     /// the garbage truck for final collection.
     pub(super) static DUMPSTER: Dumpster = Dumpster {
+        cleaning: Cell::new(false),
         contents: RefCell::new(HashMap::new()),
         n_drops: Cell::new(0),
     };
-}
-
-#[cfg(not(loom))]
-thread_local! {
-    /// Whether the currently-running thread is doing a cleanup.
-    /// This cannot be stored in `DUMPSTER` because otherwise it would cause weird use-after-drop
-    /// behavior.
-    static CLEANING: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(loom)]
-thread_local! {
-    /// Whether the currently-running thread is doing a cleanup.
-    /// This cannot be stored in `DUMPSTER` because otherwise it would cause weird use-after-drop
-    /// behavior.
-    static CLEANING: Cell<bool> = Cell::new(false);
 }
 
 /// Collect all allocations in the garbage truck (but not necessarily the dumpster), then await
@@ -169,26 +160,28 @@ pub fn notify_dropped_gc() {
     GARBAGE_TRUCK.n_gcs_existing.fetch_sub(1, Ordering::Relaxed);
     GARBAGE_TRUCK.n_gcs_dropped.fetch_add(1, Ordering::Relaxed);
 
-    // Do not do deliver or collect if we are currently cleaning or this thread is dying.
-    // This prevents deadlocks.
-    if !CLEANING.try_with(Cell::get).is_ok_and(|x| !x) {
-        return;
-    }
+    let should_collect = DUMPSTER
+        .try_with(|dumpster| {
+            // Do not deliver or collect if we are currently cleaning or this thread is dying.
+            // This prevents deadlocks.
+            if dumpster.cleaning.get() {
+                return false;
+            }
+            dumpster.n_drops.set(dumpster.n_drops.get() + 1);
+            if dumpster.is_full() {
+                dumpster.deliver_to(&GARBAGE_TRUCK);
+            }
+            let collect_cond = unsafe {
+                // SAFETY: we only ever store collection conditions in the collect-condition box
+                transmute::<*mut (), CollectCondition>(
+                    GARBAGE_TRUCK.collect_condition.load(Ordering::Relaxed),
+                )
+            };
+            collect_cond(&CollectInfo { _private: () })
+        })
+        .unwrap_or(false);
 
-    _ = DUMPSTER.try_with(|dumpster| {
-        dumpster.n_drops.set(dumpster.n_drops.get() + 1);
-        if dumpster.is_full() {
-            dumpster.deliver_to(&GARBAGE_TRUCK);
-        }
-    });
-
-    let collect_cond = unsafe {
-        // SAFETY: we only ever store collection conditions in the collect-condition box
-        transmute::<*mut (), CollectCondition>(
-            GARBAGE_TRUCK.collect_condition.load(Ordering::Relaxed),
-        )
-    };
-    if collect_cond(&CollectInfo { _private: () }) {
+    if should_collect {
         GARBAGE_TRUCK.collect_all();
     }
 }
@@ -392,7 +385,7 @@ impl GarbageTruck {
             mark(root_id, &mut ref_graph);
         }
 
-        CLEANING.with(|c| c.set(true));
+        let _ = DUMPSTER.try_with(|d| d.cleaning.set(true));
         // set of allocations which must be destroyed because we were the last weak pointer to it
         let mut weak_destroys = Vec::new();
         for (id, node) in &ref_graph {
@@ -416,7 +409,7 @@ impl GarbageTruck {
                 }
             }
         }
-        CLEANING.with(|c| c.set(false));
+        let _ = DUMPSTER.try_with(|d| d.cleaning.set(false));
         for (drop_fn, ptr) in weak_destroys {
             unsafe {
                 // SAFETY: we have proven (via header_ref.weak = 1) that the cleaning

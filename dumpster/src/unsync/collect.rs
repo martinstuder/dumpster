@@ -28,10 +28,9 @@ use crate::{
 use super::{CollectCondition, GcBox};
 
 thread_local! {
-    /// Whether the current thread is running a cleanup process.
-    static COLLECTING: Cell<bool> = const { Cell::new(false) };
     /// The global collection of allocation information for this thread.
     pub(super) static DUMPSTER: Dumpster = Dumpster {
+        collecting: Cell::new(false),
         to_collect: RefCell::new(HashMap::new()),
         n_ref_drops: Cell::new(0),
         n_refs_living: Cell::new(0),
@@ -42,6 +41,8 @@ thread_local! {
 /// A dumpster is a collection of all the garbage that may or may not need to be cleaned up.
 /// It also contains information relevant to when a cleanup should be triggered.
 pub(super) struct Dumpster {
+    /// Whether the current thread is running a cleanup process.
+    collecting: Cell<bool>,
     /// A map from allocation IDs for allocations which may need to be collected to pointers to
     /// their allocations.
     to_collect: RefCell<HashMap<AllocationId, Cleanup>>,
@@ -112,7 +113,7 @@ impl Cleanup {
 impl Dumpster {
     /// Collect all unreachable allocations that this dumpster is responsible for.
     pub fn collect_all(&self) {
-        if COLLECTING.get() {
+        if self.collecting.get() {
             return; // Do not double-collect.
         }
         self.n_ref_drops.set(0);
@@ -158,7 +159,7 @@ impl Dumpster {
                 reachable: &mark.visited,
             };
 
-            COLLECTING.set(true);
+            self.collecting.set(true);
             // Do not hold mutable reference, as it is possible for a `Gc` to be marked dirty during
             // collection by dropping.
             let mut collectees = take(&mut *self.to_collect.borrow_mut());
@@ -168,7 +169,7 @@ impl Dumpster {
             {
                 (cleanup.drop_fn)(cleanup.ptr, &mut decrementer);
             }
-            COLLECTING.set(false);
+            self.collecting.set(false);
             assert!(collectees.is_empty());
             let mut new_to_collect = self.to_collect.borrow_mut();
             if new_to_collect.is_empty() {
