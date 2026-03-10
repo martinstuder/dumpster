@@ -48,6 +48,7 @@ use std::{
     alloc::{dealloc, handle_alloc_error, Layout},
     any::TypeId,
     borrow::{Borrow, Cow},
+    cell::Cell,
     fmt::Debug,
     mem::{self, ManuallyDrop, MaybeUninit},
     num::NonZeroUsize,
@@ -144,6 +145,18 @@ static CURRENT_TAG: AtomicUsize = AtomicUsize::new(0);
 #[cfg(loom)]
 lazy_static! {
     static ref CURRENT_TAG: AtomicUsize = AtomicUsize::new(0);
+}
+
+#[cfg(not(loom))]
+thread_local! {
+    /// Per-thread cache of the last observed CURRENT_TAG.
+    /// Avoids repeated atomic stores in the hot deref path.
+    static THREAD_TAG: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(loom)]
+thread_local! {
+    static THREAD_TAG: Cell<usize> = Cell::new(0);
 }
 
 #[repr(C)]
@@ -1086,9 +1099,17 @@ impl<T: Trace + Send + Sync + ?Sized> Deref for Gc<T> {
             This is caused by accessing a Gc during a Drop implementation, likely implying a bug in your code."
         ).as_ref()
         };
-        let current_tag = CURRENT_TAG.load(Ordering::Acquire);
-        self.tag.store(current_tag, Ordering::Release);
-        box_ref.generation.store(current_tag, Ordering::Release);
+        // Fast check with Relaxed — avoids memory barrier on ARM in the common case.
+        // On epoch change, re-load with Acquire to synchronize with collect_all's Release fetch_add.
+        let current = CURRENT_TAG.load(Ordering::Relaxed);
+        THREAD_TAG.with(|tt| {
+            if tt.get() != current {
+                let current = CURRENT_TAG.load(Ordering::Acquire);
+                tt.set(current);
+                self.tag.store(current, Ordering::Release);
+                box_ref.generation.store(current, Ordering::Release);
+            }
+        });
         &box_ref.value
     }
 }
