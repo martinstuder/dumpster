@@ -181,6 +181,17 @@ thread_local! {
     /// allocation cost.  Each node in the reference graph stores a [`Range<usize>`] into this
     /// slab rather than its own heap-allocated [`Vec`].
     static CHILDREN_SLAB: RefCell<Vec<AllocationId>> = const { RefCell::new(Vec::new()) };
+
+    /// Reusable reference graph, retained between collections to amortize the cost of
+    /// re-allocating the [`HashMap`]'s backing array each sweep.
+    /// Must be cleared (not just taken) before use, since entries from a prior sweep have
+    /// dangling pointers after their GcBoxes are freed.
+    static REF_GRAPH: RefCell<HashMap<AllocationId, AllocationInfo>> =
+        RefCell::new(HashMap::new());
+
+    /// Reusable work queue for the iterative DFS, retained between collections.
+    /// Always empty when returned to storage (drained by the work loop in `collect_all`).
+    static WORK_QUEUE: RefCell<Vec<WorkItem>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Collect all allocations in the garbage truck (but not necessarily the dumpster), then await
@@ -394,15 +405,19 @@ impl GarbageTruck {
 
         let to_collect = take(&mut **self.contents.lock());
 
-        let mut ref_graph = HashMap::with_capacity(to_collect.len());
+        // Take reusable buffers from thread-local storage, retaining their heap allocations
+        // across collections to avoid re-allocating them every sweep.
+        let mut ref_graph = REF_GRAPH.with(|r| take(&mut *r.borrow_mut()));
+        ref_graph.clear(); // must clear: prior entries contain dangling pointers after GC frees
+        ref_graph.reserve(to_collect.len());
 
-        CURRENT_TAG.fetch_add(1, Ordering::Release);
-
-        // Take the reusable children slab from thread-local storage.
-        // We clear it (keeping capacity) to amortize the allocation cost across collections.
         let mut slab = CHILDREN_SLAB.with(|s| take(&mut *s.borrow_mut()));
         slab.clear();
-        let mut work_queue: Vec<WorkItem> = Vec::new();
+
+        let mut work_queue = WORK_QUEUE.with(|w| take(&mut *w.borrow_mut()));
+        // work_queue is always empty when returned (drained by the loop below)
+
+        CURRENT_TAG.fetch_add(1, Ordering::Release);
 
         for (_, TrashCan { ptr, init_fn }) in to_collect {
             unsafe {
@@ -473,8 +488,11 @@ impl GarbageTruck {
             };
         }
 
-        // Return the slab to thread-local storage, retaining its capacity for the next collection.
+        // Return buffers to thread-local storage, retaining their capacity for the next collection.
+        ref_graph.clear(); // clear again: entries now have dangling pointers after destruction
+        REF_GRAPH.with(|r| *r.borrow_mut() = ref_graph);
         CHILDREN_SLAB.with(|s| *s.borrow_mut() = slab);
+        WORK_QUEUE.with(|w| *w.borrow_mut() = work_queue);
 
         drop(collecting_guard);
     }
@@ -541,6 +559,9 @@ unsafe fn snapshot_node<T: Trace + Send + Sync + ?Sized>(
         ptr.specify::<GcBox<T>>().as_ref()
     };
 
+    // Load current_tag once here; the Dfs visitor caches it to avoid per-edge atomic loads.
+    let current_tag = CURRENT_TAG.load(Ordering::Relaxed);
+
     let children_start = slab.len();
     // Scope the visitor so that its mutable borrows of `slab`, `ref_graph`, and `work_queue`
     // are released before we read `slab.len()` and mutate `ref_graph` below.
@@ -551,13 +572,13 @@ unsafe fn snapshot_node<T: Trace + Send + Sync + ?Sized>(
             current_id: id,
             mark_current: false,
             work_queue,
+            current_tag,
         };
         let result = box_ref.value.accept(&mut visitor);
         (result, visitor.mark_current)
     };
     let children_end = slab.len();
 
-    let current_tag = CURRENT_TAG.load(Ordering::Relaxed);
     let needs_mark = accept_result.is_err()
         || box_ref.generation.load(Ordering::Acquire) >= current_tag
         || mark_current;
@@ -599,6 +620,9 @@ pub(super) struct Dfs<'a> {
     mark_current: bool,
     /// Work queue: allocations whose children still need to be snapshotted.
     work_queue: &'a mut Vec<WorkItem>,
+    /// The value of [`CURRENT_TAG`] at the start of the current collection sweep, cached here
+    /// to avoid one atomic load per edge traversal in [`Visitor::visit_sync`].
+    current_tag: usize,
 }
 
 impl Visitor for Dfs<'_> {
@@ -619,9 +643,8 @@ impl Visitor for Dfs<'_> {
             // SAFETY: same as above.
             ptr.as_ref()
         };
-        let current_tag = CURRENT_TAG.load(Ordering::Relaxed);
-        if gc.tag.swap(current_tag, Ordering::Relaxed) >= current_tag
-            || box_ref.generation.load(Ordering::Acquire) >= current_tag
+        if gc.tag.swap(self.current_tag, Ordering::Relaxed) >= self.current_tag
+            || box_ref.generation.load(Ordering::Acquire) >= self.current_tag
         {
             // This pointer was already tagged by this sweep, so it must have been moved by
             // a concurrent thread — the current node is reachable.
