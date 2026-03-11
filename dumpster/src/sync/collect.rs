@@ -13,7 +13,8 @@ use std::{
     cell::{Cell, LazyCell, RefCell},
     collections::hash_map::Entry,
     hash::Hash,
-    mem::{replace, swap, take, transmute},
+    mem::{replace, take, transmute},
+    ops::Range,
     ptr::{drop_in_place, NonNull},
 };
 
@@ -78,9 +79,15 @@ pub(super) struct AllocationId(NonNull<GcBox<()>>);
 pub(super) struct TrashCan {
     /// A pointer to the allocation to be cleaned up.
     ptr: Erased,
-    /// The function which can be used to build a reference graph.
+    /// The function which inserts the allocation into the reference graph and enqueues it for
+    /// child snapshotting.
     /// This function is safe to call on `ptr`.
-    dfs_fn: unsafe fn(Erased, &mut HashMap<AllocationId, AllocationInfo>),
+    init_fn: unsafe fn(
+        Erased,
+        &mut HashMap<AllocationId, AllocationInfo>,
+        &mut Vec<AllocationId>,
+        &mut Vec<WorkItem>,
+    ),
 }
 
 #[derive(Debug)]
@@ -100,8 +107,9 @@ struct AllocationInfo {
 enum Reachability {
     /// The information describing an allocation whose accessibility is unknown.
     Unknown {
-        /// The IDs for the allocations directly accessible from this allocation.
-        children: Vec<AllocationId>,
+        /// The range within the children slab for the allocations directly accessible from this
+        /// allocation.
+        children_range: Range<usize>,
         /// The number of references in the reference count for this allocation which are
         /// "unaccounted," which have not been found while constructing the graph.
         /// It is the difference between the allocations indegree in the "true" reference graph vs
@@ -113,6 +121,23 @@ enum Reachability {
     /// The allocation here is reachable.
     /// No further information is needed.
     Reachable,
+}
+
+/// A pending work item for the iterative DFS work queue.
+///
+/// Each item represents an allocation that has been inserted into the reference graph but whose
+/// children have not yet been snapshotted into the children slab.
+#[derive(Debug)]
+struct WorkItem {
+    /// The allocation to snapshot.
+    id: AllocationId,
+    /// The type-erased snapshot function, monomorphized over the allocation's concrete type.
+    snapshot_fn: unsafe fn(
+        AllocationId,
+        &mut HashMap<AllocationId, AllocationInfo>,
+        &mut Vec<AllocationId>,
+        &mut Vec<WorkItem>,
+    ),
 }
 
 #[cfg(not(loom))]
@@ -149,6 +174,13 @@ thread_local! {
     /// This cannot be stored in `DUMPSTER` because otherwise it would cause weird use-after-drop
     /// behavior.
     static CLEANING: Cell<bool> = Cell::new(false);
+}
+
+thread_local! {
+    /// Reusable flat slab of child [`AllocationId`]s, retained between collections to amortize
+    /// allocation cost.  Each node in the reference graph stores a [`Range<usize>`] into this
+    /// slab rather than its own heap-allocated [`Vec`].
+    static CHILDREN_SLAB: RefCell<Vec<AllocationId>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Collect all allocations in the garbage truck (but not necessarily the dumpster), then await
@@ -217,7 +249,7 @@ where
                 AllocationId::from(allocation),
                 TrashCan {
                     ptr: Erased::new(allocation),
-                    dfs_fn: dfs::<T>,
+                    init_fn: init_root::<T>,
                 },
             )
             .is_none()
@@ -366,12 +398,27 @@ impl GarbageTruck {
 
         CURRENT_TAG.fetch_add(1, Ordering::Release);
 
-        for (_, TrashCan { ptr, dfs_fn }) in to_collect {
+        // Take the reusable children slab from thread-local storage.
+        // We clear it (keeping capacity) to amortize the allocation cost across collections.
+        let mut slab = CHILDREN_SLAB.with(|s| take(&mut *s.borrow_mut()));
+        slab.clear();
+        let mut work_queue: Vec<WorkItem> = Vec::new();
+
+        for (_, TrashCan { ptr, init_fn }) in to_collect {
             unsafe {
                 // SAFETY: `ptr` may only be in `to_collect` if it was a valid pointer
-                // and `dfs_fn` must have been created with the intent of referring to
+                // and `init_fn` must have been created with the intent of referring to
                 // the erased type of `ptr`.
-                dfs_fn(ptr, &mut ref_graph);
+                init_fn(ptr, &mut ref_graph, &mut slab, &mut work_queue);
+            }
+        }
+
+        // Drain the work queue, snapshotting each allocation's children into the slab.
+        while let Some(WorkItem { id, snapshot_fn }) = work_queue.pop() {
+            unsafe {
+                // SAFETY: `id` was inserted into `ref_graph` by `init_root` or `Dfs::visit_sync`,
+                // and `snapshot_fn` is monomorphized for its concrete type.
+                snapshot_fn(id, &mut ref_graph, &mut slab, &mut work_queue);
             }
         }
 
@@ -389,7 +436,7 @@ impl GarbageTruck {
             })
             .collect::<Vec<_>>();
         for root_id in root_ids {
-            mark(root_id, &mut ref_graph);
+            mark(root_id, &mut ref_graph, &slab);
         }
 
         CLEANING.with(|c| c.set(true));
@@ -425,31 +472,29 @@ impl GarbageTruck {
                 drop_fn(ptr);
             };
         }
+
+        // Return the slab to thread-local storage, retaining its capacity for the next collection.
+        CHILDREN_SLAB.with(|s| *s.borrow_mut() = slab);
+
         drop(collecting_guard);
     }
 }
 
-/// Build out a part of the reference graph, making note of all allocations which are reachable from
-/// the one described in `ptr`.
+/// Insert a root allocation into the reference graph and enqueue it for child snapshotting.
 ///
-/// # Inputs
-///
-/// - `ptr`: A pointer to the allocation that we should start constructing from.
-/// - `ref_graph`: A lookup from allocation IDs to node information about that allocation.
-///
-/// # Effects
-///
-/// `ref_graph` will be expanded to include all allocations reachable from `ptr`.
+/// This is called once per entry in `to_collect` at the start of each collection sweep.
 ///
 /// # Safety
 ///
 /// `ptr` must have been created as a pointer to a `GcBox<T>`.
-unsafe fn dfs<T: Trace + Send + Sync + ?Sized>(
+unsafe fn init_root<T: Trace + Send + Sync + ?Sized>(
     ptr: Erased,
     ref_graph: &mut HashMap<AllocationId, AllocationInfo>,
+    _slab: &mut Vec<AllocationId>,
+    work_queue: &mut Vec<WorkItem>,
 ) {
     let box_ref = unsafe {
-        // SAFETY: We require `ptr` to be a an erased pointer to `GcBox<T>`.
+        // SAFETY: We require `ptr` to be an erased pointer to `GcBox<T>`.
         ptr.specify::<GcBox<T>>().as_ref()
     };
     let starting_id = AllocationId::from(box_ref);
@@ -464,36 +509,96 @@ unsafe fn dfs<T: Trace + Send + Sync + ?Sized>(
         ptr,
         weak_drop_fn: drop_weak_zero::<T>,
         reachability: Reachability::Unknown {
-            children: Vec::new(),
+            children_range: 0..0, // filled in by snapshot_node
             n_unaccounted: strong_count,
             destroy_fn: destroy_erased::<T>,
         },
     });
+    work_queue.push(WorkItem {
+        id: starting_id,
+        snapshot_fn: snapshot_node::<T>,
+    });
+}
 
-    if box_ref
-        .value
-        .accept(&mut Dfs {
+/// Snapshot all direct children of `id` into the slab, updating the reference graph.
+///
+/// All children are appended contiguously to `slab` and the node's `children_range` is updated.
+/// Newly discovered children are inserted into `ref_graph` and enqueued in `work_queue`.
+///
+/// # Safety
+///
+/// `id` must refer to a `GcBox<T>` that is present in `ref_graph`.
+unsafe fn snapshot_node<T: Trace + Send + Sync + ?Sized>(
+    id: AllocationId,
+    ref_graph: &mut HashMap<AllocationId, AllocationInfo>,
+    slab: &mut Vec<AllocationId>,
+    work_queue: &mut Vec<WorkItem>,
+) {
+    // Copy the raw pointer out of the map so we don't hold a borrow while mutating ref_graph.
+    let ptr = ref_graph[&id].ptr;
+    let box_ref = unsafe {
+        // SAFETY: caller guarantees `id` refers to a valid `GcBox<T>`.
+        ptr.specify::<GcBox<T>>().as_ref()
+    };
+
+    let children_start = slab.len();
+    // Scope the visitor so that its mutable borrows of `slab`, `ref_graph`, and `work_queue`
+    // are released before we read `slab.len()` and mutate `ref_graph` below.
+    let (accept_result, mark_current) = {
+        let mut visitor = Dfs {
             ref_graph,
-            current_id: starting_id,
-        })
-        .is_err()
-        || box_ref.generation.load(Ordering::Acquire) >= CURRENT_TAG.load(Ordering::Relaxed)
+            slab,
+            current_id: id,
+            mark_current: false,
+            work_queue,
+        };
+        let result = box_ref.value.accept(&mut visitor);
+        (result, visitor.mark_current)
+    };
+    let children_end = slab.len();
+
+    let current_tag = CURRENT_TAG.load(Ordering::Relaxed);
+    let needs_mark = accept_result.is_err()
+        || box_ref.generation.load(Ordering::Acquire) >= current_tag
+        || mark_current;
+
+    // Record the contiguous range of children for this node.
+    if let Some(AllocationInfo {
+        reachability:
+            Reachability::Unknown {
+                ref mut children_range,
+                ..
+            },
+        ..
+    }) = ref_graph.get_mut(&id)
     {
-        // box_ref.value was accessed while we worked
-        // mark this allocation as reachable
-        mark(starting_id, ref_graph);
+        *children_range = children_start..children_end;
+    }
+
+    if needs_mark {
+        mark(id, ref_graph, slab);
     }
 }
 
 #[derive(Debug)]
 /// The visitor structure used for building the found-reference-graph of allocations.
+///
+/// Unlike the old recursive visitor, this one only snapshots the immediate children of the current
+/// node into the slab without recursing.  Recursion is replaced by the iterative work queue in
+/// [`GarbageTruck::collect_all`].
 pub(super) struct Dfs<'a> {
     /// The reference graph.
     /// Each allocation is assigned a node.
     ref_graph: &'a mut HashMap<AllocationId, AllocationInfo>,
+    /// Flat slab of child allocation IDs shared across all nodes in this collection sweep.
+    slab: &'a mut Vec<AllocationId>,
     /// The allocation ID currently being visited.
-    /// Used for knowing which node is the parent of another.
     current_id: AllocationId,
+    /// Set to `true` if a tag/generation check on any child indicates the current node is
+    /// reachable from outside the candidate set.
+    mark_current: bool,
+    /// Work queue: allocations whose children still need to be snapshotted.
+    work_queue: &'a mut Vec<WorkItem>,
 }
 
 impl Visitor for Dfs<'_> {
@@ -519,25 +624,25 @@ impl Visitor for Dfs<'_> {
             || box_ref.generation.load(Ordering::Acquire) >= current_tag
         {
             // This pointer was already tagged by this sweep, so it must have been moved by
-            mark(self.current_id, self.ref_graph);
+            // a concurrent thread — the current node is reachable.
+            self.mark_current = true;
             return;
         }
 
-        let mut new_id = AllocationId::from(box_ref);
-
-        let Reachability::Unknown {
-            ref mut children, ..
-        } = self
-            .ref_graph
-            .get_mut(&self.current_id)
-            .unwrap()
-            .reachability
-        else {
-            // this node has been proven reachable by something higher up. No need to keep building
-            // its ref graph
+        // Optimization: if the current node has already been proven reachable (e.g. by a
+        // concurrent marking propagated from an ancestor), there is no point building its
+        // children list further.
+        if !matches!(
+            self.ref_graph[&self.current_id].reachability,
+            Reachability::Unknown { .. }
+        ) {
             return;
-        };
-        children.push(new_id);
+        }
+
+        let new_id = AllocationId::from(box_ref);
+
+        // Record this child in the slab (the range is finalized by snapshot_node after accept).
+        self.slab.push(new_id);
 
         match self.ref_graph.entry(new_id) {
             Entry::Occupied(mut o) => match o.get_mut().reachability {
@@ -550,32 +655,23 @@ impl Visitor for Dfs<'_> {
                 Reachability::Reachable => (),
             },
             Entry::Vacant(v) => {
-                // This allocation has never been visited by the reference graph builder
+                // This allocation has never been visited by the reference graph builder.
                 let strong_count = box_ref.strong.load(Ordering::Acquire);
                 box_ref.weak.fetch_add(1, Ordering::Acquire);
                 v.insert(AllocationInfo {
                     ptr: Erased::new(ptr),
                     weak_drop_fn: drop_weak_zero::<T>,
                     reachability: Reachability::Unknown {
-                        children: Vec::new(),
+                        children_range: 0..0, // filled in when this node is dequeued
                         n_unaccounted: strong_count - 1,
                         destroy_fn: destroy_erased::<T>,
                     },
                 });
-
-                // Save the previously visited ID, then carry on to the next one
-                swap(&mut new_id, &mut self.current_id);
-
-                if box_ref.value.accept(self).is_err()
-                    || box_ref.generation.load(Ordering::Acquire) >= current_tag
-                {
-                    // On failure, this means `**gc` is accessible, and should be marked
-                    // as such
-                    mark(self.current_id, self.ref_graph);
-                }
-
-                // Restore current_id and carry on
-                swap(&mut new_id, &mut self.current_id);
+                // Enqueue for snapshotting rather than recursing immediately.
+                self.work_queue.push(WorkItem {
+                    id: new_id,
+                    snapshot_fn: snapshot_node::<T>,
+                });
             }
         }
     }
@@ -590,13 +686,17 @@ impl Visitor for Dfs<'_> {
 
 /// Traverse the reference graph, marking `root` and any allocations reachable from `root` as
 /// reachable.
-fn mark(root: AllocationId, graph: &mut HashMap<AllocationId, AllocationInfo>) {
+fn mark(
+    root: AllocationId,
+    graph: &mut HashMap<AllocationId, AllocationInfo>,
+    slab: &[AllocationId],
+) {
     let node = graph.get_mut(&root).unwrap();
-    if let Reachability::Unknown { children, .. } =
+    if let Reachability::Unknown { children_range, .. } =
         replace(&mut node.reachability, Reachability::Reachable)
     {
-        for child in children {
-            mark(child, graph);
+        for &child in &slab[children_range] {
+            mark(child, graph, slab);
         }
     }
 }
